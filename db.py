@@ -10,6 +10,8 @@ API ref: https://docs.turso.tech/sdk/http/reference (v2 pipeline endpoint)
 from __future__ import annotations
 
 import os
+import socket
+import time
 from datetime import datetime, timezone
 from typing import Any, Sequence
 from uuid import uuid4
@@ -167,21 +169,53 @@ def _unwrap(cell: dict) -> Any:
     return v
 
 
+def _prewarm_dns(url: str) -> str | None:
+    """Force a fresh DNS lookup so we get past any negative caches in the
+    container. Returns the resolved IP for diagnostic purposes, or None if
+    resolution fails."""
+    try:
+        from urllib.parse import urlparse
+        host = urlparse(url).hostname
+        if not host:
+            return None
+        return socket.gethostbyname(host)
+    except Exception:
+        return None
+
+
 def _pipeline(statements: Sequence[tuple[str, Sequence[Any]]]) -> list[dict]:
     requests_body = [
         {"type": "execute", "stmt": {"sql": sql, "args": [_arg(a) for a in args]}}
         for sql, args in statements
     ]
     requests_body.append({"type": "close"})
-    resp = requests.post(
-        _http_base_url().rstrip("/") + "/v2/pipeline",
-        json={"requests": requests_body},
-        headers={
-            "Authorization": f"Bearer {_secret('turso_auth_token')}",
-            "Content-Type": "application/json",
-        },
-        timeout=15,
-    )
+
+    base = _http_base_url().rstrip("/")
+    url = base + "/v2/pipeline"
+    headers = {
+        "Authorization": f"Bearer {_secret('turso_auth_token')}",
+        "Content-Type": "application/json",
+    }
+
+    last_err: Exception | None = None
+    dns_attempts: list[str] = []
+    for attempt in range(4):
+        # Force a fresh DNS lookup each attempt; record what we got.
+        resolved = _prewarm_dns(base)
+        dns_attempts.append(f"attempt {attempt + 1}: {resolved or 'FAILED'}")
+        try:
+            resp = requests.post(url, json={"requests": requests_body}, headers=headers, timeout=20)
+            break
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            last_err = e
+            time.sleep(0.5 * (2 ** attempt))  # 0.5s, 1s, 2s, 4s
+    else:
+        # All retries exhausted
+        raise RuntimeError(
+            f"Could not reach Turso at {url} after 4 retries. "
+            f"DNS attempts: {dns_attempts}. Last error: {type(last_err).__name__}: {last_err}"
+        )
+
     if resp.status_code != 200:
         raise RuntimeError(f"Turso HTTP {resp.status_code}: {resp.text[:500]}")
     payload = resp.json()
