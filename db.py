@@ -121,12 +121,18 @@ def _secret(name: str) -> str:
 
 
 def _http_base_url() -> str:
-    raw = _secret("turso_database_url").strip()
+    raw = _secret("turso_database_url").strip().strip('"').strip("'")
     if raw.startswith("libsql://"):
         return "https://" + raw[len("libsql://"):]
     if raw.startswith("https://"):
         return raw
-    raise RuntimeError(f"Unexpected turso_database_url scheme: {raw!r}")
+    # Bare hostname like "rts-slush-fund-sloanschneiter.turso.io" — assume https
+    if raw.endswith(".turso.io") and "/" not in raw:
+        return "https://" + raw
+    raise RuntimeError(
+        f"Unexpected turso_database_url value (length={len(raw)}, starts with "
+        f"{raw[:12]!r}). Expected something like 'libsql://your-db-org.turso.io'."
+    )
 
 
 def _arg(value: Any) -> dict:
